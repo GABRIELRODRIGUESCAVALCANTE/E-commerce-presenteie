@@ -1,6 +1,8 @@
 # 🎁 E-commerce Presenteie
 
-Um E-commerce completo, seguro e moderno, focado em presentes personalizados e retiradas no local. Construído com as melhores práticas de segurança e desenvolvimento ágil, garantindo estabilidade e escalabilidade para vendas.
+Um E-commerce completo, seguro e moderno, focado em presentes personalizados e retiradas no local. Construído com as melhores práticas de segurança e desenvolvimento ágil, garantindo estabilidade, observabilidade e escalabilidade para vendas.
+
+---
 
 ## 🚀 Tecnologias Utilizadas
 
@@ -8,6 +10,8 @@ Um E-commerce completo, seguro e moderno, focado em presentes personalizados e r
 - **Express.js:** Roteamento e gerenciamento da API.
 - **PostgreSQL:** Banco de Dados Relacional.
 - **pg (node-postgres):** Pool de conexões e transações assíncronas nativas (`BEGIN`/`COMMIT`).
+- **Pino & Pino-HTTP:** Sistema profissional de logging JSON de alta performance.
+- **Auditoria de Segurança (PostgreSQL JSONB):** Registros persistentes de ações críticas com cálculo de diff (`old_values` vs `new_values`).
 - **Better Auth:** Autenticação completa e segura (Google OAuth, Sessões seguras em banco de dados).
 - **Nodemailer:** Disparos de E-mail via SMTP do Gmail.
 - **Cloudinary:** Armazenamento escalável e otimizado para as fotos dos presentes.
@@ -23,14 +27,16 @@ Um E-commerce completo, seguro e moderno, focado em presentes personalizados e r
 
 ---
 
-## 🛡️ Segurança (Security By Design)
-A arquitetura deste projeto passou por uma bateria rigorosa de testes, apresentando robustez total contra ataques comuns:
+## 🛡️ Segurança e Observabilidade (Security & Audit By Design)
 
+- **Auditoria Persistente:** Operações críticas (criação/edição/exclusão de produtos, alteração de estoque, criação e atualização de pedidos, acessos não autorizados) geram registros auditáveis em tabela PostgreSQL `audit_logs`.
+- **Rastreabilidade por `requestId`:** Correlação end-to-end entre requisições HTTP, logs da aplicação e registros no banco via cabeçalho `X-Request-ID`.
+- **Redação Automática de Dados Sensíveis:** Senhas, tokens, cartões e segredos são omitidos tanto nos logs JSON quanto nas colunas `JSONB` de auditoria.
 - **Anti-Fraude de Preços (Server-Side Calculation):** Todos os valores financeiros no checkout são recalculados baseados nos preços intocáveis do banco de dados, protegidos por locks de linha (`FOR UPDATE`) para evitar estourar o estoque.
-- **Zero Vazamento de Credenciais:** As credenciais críticas ficam retidas em variáveis de ambiente `.env`, impossíveis de serem empurradas ao GitHub devido a exclusões rígidas no `.gitignore`.
-- **Prevenção de IDOR e Hijacking:** O servidor nunca confia no ID do usuário passado pelo corpo das requisições; toda operação lê diretamente a sessão criptografada decodificada nos cabeçalhos HTTP.
-- **Exclusões Seguras (Soft-Deletes):** Para não quebrar relações de pedidos antigos (chaves estrangeiras), a exclusão de produtos do catálogo apenas "arquiva" o item (`ativo = false`), escondendo-o da vitrine, sem danificar a base contábil.
-- **Integração de Notificações Assíncronas:** Hooks de banco disparam e-mails via Nodemailer num fio independente da API, garantindo que o servidor não sofra *timeout* em picos.
+- **Zero Vazamento de Credenciais:** As credenciais críticas ficam retidas em variáveis de ambiente `.env`.
+- **Exclusões Seguras (Soft-Deletes):** A exclusão de produtos arquiva o item (`ativo = false`), preservando relacionamentos contábeis em `itens_pedido`.
+
+Para documentação completa sobre o sistema de auditoria e logs, veja [AUDIT.md](file:///home/gabriel/Documents/Projeto-presenteie/AUDIT.md).
 
 ---
 
@@ -66,7 +72,11 @@ DB_USER=postgres
 DB_PASSWORD=sua_senha
 DB_HOST=localhost
 DB_PORT=5432
-DB_NAME=postgres
+DB_NAME=presenteie
+
+LOG_LEVEL=info
+AUDIT_RETENTION_DAYS=90
+
 BETTER_AUTH_SECRET="gerar-chave-super-segura-aqui"
 
 FRONTEND_URL=http://localhost:5173
@@ -82,14 +92,21 @@ EMAIL_USER=seu_email@gmail.com
 EMAIL_PASS=sua_senha_de_app_do_gmail
 ```
 
-No frontend (dentro da pasta `front/`), crie outro `.env`:
+### 3. Migrations e Banco de Dados
 
-```env
-VITE_API_URL=http://localhost:3001/api
-VITE_ADMIN_EMAIL=seu_email@gmail.com
+```bash
+# Executa as migrations para criar as tabelas de auditoria e controle
+npm run migrate
 ```
 
-### 3. Rodando os Servidores
+### 4. Executando os Testes
+
+```bash
+# Roda a suíte de testes de auditoria e segurança
+npm test
+```
+
+### 5. Rodando os Servidores
 
 ```bash
 # Em um terminal (Inicia o Backend na porta 3001)
