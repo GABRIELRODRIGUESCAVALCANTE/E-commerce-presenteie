@@ -27,7 +27,7 @@ export default function Header({
               Meus Pedidos
             </Link>
           )}
-          {session?.user?.email === (import.meta.env.VITE_ADMIN_EMAIL || 'teste@gmail.com') && (
+          {session && import.meta.env.VITE_ADMIN_EMAIL && session.user.email.toLowerCase() === import.meta.env.VITE_ADMIN_EMAIL.toLowerCase() && (
             <Link to="/admin" className={`nav-link ${isActive('/admin') ? 'nav-link--active' : ''}`}>
               Painel Admin
             </Link>

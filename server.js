@@ -1,4 +1,5 @@
 require('dotenv').config();
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -13,6 +14,19 @@ const logger = require('./lib/logger');
 const requestLogger = require('./middleware/requestLogger');
 const auditService = require('./services/auditService');
 const runMigrations = require('./scripts/migrate');
+
+/**
+ * Escapa caracteres HTML perigosos para prevenir HTML/Script Injection em e-mails e respostas.
+ */
+function escapeHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -44,19 +58,29 @@ const transporter = nodemailer.createTransport({
 
 const app = express();
 
+// Suporte a Proxy Reverso (Nginx, Cloudflare, etc.) para correta identificação de IPs e Rate Limiting
+app.set('trust proxy', 1);
+
 // Middlewares de Segurança Básicos
 app.use(helmet());
 
 // Logging de requisições HTTP (com requestId e redação de segredos)
 app.use(requestLogger);
 
-// Rate Limiting (100 reqs a cada 15 min)
+// Rate Limiting Global da API (300 reqs a cada 15 min)
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 300,
   message: { error: 'Muitas requisições. Tente novamente mais tarde.' }
 });
 app.use(limiter);
+
+// Rate Limiter Específico para criação de pedidos (evita checkout spam / DoS de estoque)
+const orderLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { error: 'Muitas tentativas de pedido. Aguarde alguns minutos.' }
+});
 
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
@@ -64,13 +88,17 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '1mb' }));
 
-// Configuração do Banco de Dados
+// Configuração do Banco de Dados com Pool Seguro
 const pool = new Pool({
   user: process.env.DB_USER,
   host: process.env.DB_HOST,
   database: process.env.DB_NAME,
   password: process.env.DB_PASSWORD,
   port: process.env.DB_PORT,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : undefined
 });
 
 // Executa migrations do banco de forma automática e não-bloqueante na inicialização
@@ -99,11 +127,12 @@ const auth = betterAuth({
       create: {
         after: async (user) => {
           try {
+            const safeFirstName = escapeHtml(user.name ? user.name.split(' ')[0] : 'Cliente');
             await transporter.sendMail({
               from: `"Presenteie" <${process.env.EMAIL_USER}>`,
               to: user.email,
               subject: `Bem-vindo(a) à Presenteie! 🎉`,
-              html: `<h1>Olá, ${user.name.split(' ')[0]}!</h1>
+              html: `<h1>Olá, ${safeFirstName}!</h1>
                      <p>Ficamos muito felizes em ter você aqui.</p>
                      <p>A <strong>Presenteie</strong> foi criada para te ajudar a encontrar os melhores presentes para quem você ama.</p>
                      <p>Explore nossa vitrine e fique à vontade para entrar em contato se precisar de ajuda!</p>
@@ -120,7 +149,7 @@ const auth = betterAuth({
     accountLinking: {
       enabled: true,
       trustedProviders: ["google"],
-      requireLocalEmailVerified: false
+      requireLocalEmailVerified: true
     }
   },
   secret: process.env.BETTER_AUTH_SECRET,
@@ -172,8 +201,8 @@ const requireAdmin = async (req, res, next) => {
     }
     
     req.user = session.user;
-    const adminEmail = process.env.ADMIN_EMAIL || 'teste@gmail.com';
-    if (session.user.email.toLowerCase() !== adminEmail.toLowerCase()) {
+    const adminEmail = process.env.ADMIN_EMAIL;
+    if (!adminEmail || session.user.email.toLowerCase() !== adminEmail.toLowerCase()) {
       auditService.logSecurityEvent(pool, req, 'FORBIDDEN_ACCESS_ATTEMPT', {
         resourceType: 'admin',
         resourceId: req.originalUrl,
@@ -212,8 +241,8 @@ app.get('/api/produtos', async (req, res) => {
     let isAdmin = false;
     try {
       const session = await auth.api.getSession({ headers: req.headers });
-      const adminEmail = process.env.ADMIN_EMAIL || 'teste@gmail.com';
-      isAdmin = session?.user?.email?.toLowerCase() === adminEmail.toLowerCase();
+      const adminEmail = process.env.ADMIN_EMAIL;
+      isAdmin = Boolean(adminEmail && session?.user?.email?.toLowerCase() === adminEmail.toLowerCase());
     } catch (err) {}
 
     let queryStr = `
@@ -230,8 +259,9 @@ app.get('/api/produtos', async (req, res) => {
     }
 
     if (busca) {
+      const sanitizedBusca = String(busca).replace(/[%_\\]/g, '\\$&');
       queryStr += ` AND (p.nome ILIKE $${paramIndex} OR p.descricao ILIKE $${paramIndex})`;
-      values.push(`%${busca}%`);
+      values.push(`%${sanitizedBusca}%`);
       paramIndex++;
     }
 
@@ -257,6 +287,157 @@ app.get('/api/produtos', async (req, res) => {
   } catch (err) {
     logger.error({ err, requestId: req.requestId }, 'Erro ao buscar produtos');
     res.status(500).json({ erro: 'Erro ao buscar produtos' });
+  }
+});
+
+// ==========================================
+// ROTAS DE VERIFICAÇÃO DE E-MAIL (OTP)
+// ==========================================
+const verificationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Muitas solicitações de código. Aguarde alguns minutos.' }
+});
+
+app.post('/api/auth/send-verification-code', verificationLimiter, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ error: 'E-mail é obrigatório.' });
+    }
+
+    const emailTrimmed = email.trim().toLowerCase();
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(emailTrimmed)) {
+      return res.status(400).json({ error: 'Formato de e-mail inválido.' });
+    }
+
+    // Verificar se já existe conta com este e-mail
+    const existingUser = await pool.query('SELECT id FROM "user" WHERE LOWER(email) = $1', [emailTrimmed]);
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({ error: 'Já existe uma conta com este e-mail. Faça login.' });
+    }
+
+    // Verificar cooldown de 60 segundos
+    const recent = await pool.query(
+      `SELECT created_at FROM email_verifications 
+       WHERE LOWER(email) = $1 AND created_at > NOW() - INTERVAL '60 seconds'
+       ORDER BY id DESC LIMIT 1`,
+      [emailTrimmed]
+    );
+    if (recent.rows.length > 0) {
+      return res.status(429).json({ error: 'Aguarde 60 segundos antes de solicitar um novo código.' });
+    }
+
+    // Gerar código numérico de 6 dígitos
+    const code = String(crypto.randomInt(100000, 1000000));
+    const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+
+    // Invalida códigos anteriores e insere novo
+    await pool.query('DELETE FROM email_verifications WHERE LOWER(email) = $1', [emailTrimmed]);
+    await pool.query(
+      `INSERT INTO email_verifications (email, code_hash, expires_at)
+       VALUES ($1, $2, NOW() + INTERVAL '10 minutes')`,
+      [emailTrimmed, codeHash]
+    );
+
+    // Enviar e-mail formatado com o código
+    await transporter.sendMail({
+      from: `"Presenteie" <${process.env.EMAIL_USER}>`,
+      to: emailTrimmed,
+      subject: `Seu Código de Verificação: ${code} 🎁`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 24px; border: 1px solid #f0e6e8; border-radius: 12px; background-color: #fff;">
+          <h2 style="color: #c94c65; text-align: center; margin-bottom: 8px;">Bem-vindo(a) à Presenteie! 🎉</h2>
+          <p style="color: #555; text-align: center; font-size: 15px; margin-bottom: 24px;">
+            Para garantir a segurança da sua conta e o envio correto das atualizações dos seus pedidos, confirme seu e-mail usando o código abaixo:
+          </p>
+          <div style="background: #fff5f7; border: 2px dashed #c94c65; border-radius: 10px; padding: 18px; text-align: center; margin: 20px 0;">
+            <span style="font-size: 32px; font-weight: 800; letter-spacing: 6px; color: #c94c65; font-family: monospace;">
+              ${code}
+            </span>
+          </div>
+          <p style="color: #777; font-size: 13px; text-align: center; margin-top: 16px;">
+            ⏱️ Este código expira em <strong>10 minutos</strong>.<br>
+            Se você não solicitou este cadastro, ignore este e-mail.
+          </p>
+        </div>
+      `
+    });
+
+    auditService.saveAuditLog(pool, {
+      userEmail: emailTrimmed,
+      action: 'VERIFICATION_CODE_SENT',
+      resourceType: 'auth',
+      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+      userAgent: req.get('user-agent'),
+      requestId: req.requestId,
+      success: true
+    });
+
+    res.json({ message: 'Código de verificação enviado para seu e-mail!' });
+  } catch (error) {
+    logger.error({ err: error, requestId: req.requestId }, 'Erro ao enviar código de verificação');
+    res.status(500).json({ error: 'Erro ao enviar código de verificação. Tente novamente.' });
+  }
+});
+
+app.post('/api/auth/verify-code', verificationLimiter, async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) {
+      return res.status(400).json({ error: 'E-mail e código são obrigatórios.' });
+    }
+
+    const emailTrimmed = email.trim().toLowerCase();
+    const cleanCode = String(code).trim();
+
+    if (!/^\d{6}$/.test(cleanCode)) {
+      return res.status(400).json({ error: 'O código deve conter 6 dígitos numéricos.' });
+    }
+
+    const verificationRecord = await pool.query(
+      `SELECT * FROM email_verifications 
+       WHERE LOWER(email) = $1 AND expires_at > NOW()
+       ORDER BY id DESC LIMIT 1`,
+      [emailTrimmed]
+    );
+
+    if (verificationRecord.rows.length === 0) {
+      return res.status(400).json({ error: 'Código expirado ou não encontrado. Solicite um novo código.' });
+    }
+
+    const record = verificationRecord.rows[0];
+
+    if (record.attempts >= 5) {
+      await pool.query('DELETE FROM email_verifications WHERE id = $1', [record.id]);
+      return res.status(400).json({ error: 'Número máximo de tentativas excedido. Solicite um novo código.' });
+    }
+
+    const inputHash = crypto.createHash('sha256').update(cleanCode).digest('hex');
+
+    if (inputHash !== record.code_hash) {
+      await pool.query('UPDATE email_verifications SET attempts = attempts + 1 WHERE id = $1', [record.id]);
+      return res.status(400).json({ error: 'Código incorreto. Verifique seu e-mail e tente novamente.' });
+    }
+
+    // Sucesso na validação - remove o registro de verificação
+    await pool.query('DELETE FROM email_verifications WHERE id = $1', [record.id]);
+
+    auditService.saveAuditLog(pool, {
+      userEmail: emailTrimmed,
+      action: 'EMAIL_VERIFIED_SUCCESS',
+      resourceType: 'auth',
+      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+      userAgent: req.get('user-agent'),
+      requestId: req.requestId,
+      success: true
+    });
+
+    res.json({ success: true, message: 'E-mail verificado com sucesso!' });
+  } catch (error) {
+    logger.error({ err: error, requestId: req.requestId }, 'Erro ao verificar código');
+    res.status(500).json({ error: 'Erro ao validar código.' });
   }
 });
 
@@ -374,16 +555,21 @@ app.post('/api/categorias', requireAdmin, async (req, res) => {
 app.post('/api/produtos', requireAdmin, upload.single('imagem'), async (req, res) => {
   try {
     const { categoria_id, nome, descricao, preco, estoque } = req.body;
-    let imagem_url = req.body.imagem_url || null;
+    let imagem_url = null;
 
     if (req.file) {
       const b64 = Buffer.from(req.file.buffer).toString('base64');
       const dataURI = "data:" + req.file.mimetype + ";base64," + b64;
       const cldRes = await cloudinary.uploader.upload(dataURI, {
-        resource_type: "auto",
+        resource_type: "image",
         folder: "presenteie"
       });
       imagem_url = cldRes.secure_url;
+    } else if (req.body.imagem_url) {
+      const urlStr = String(req.body.imagem_url).trim();
+      if (urlStr.startsWith('http://') || urlStr.startsWith('https://')) {
+        imagem_url = urlStr;
+      }
     }
 
     const catId = categoria_id ? categoria_id : null;
@@ -578,13 +764,20 @@ app.delete('/api/produtos/:id', requireAdmin, async (req, res) => {
 // ==========================================
 // ROTA: FINALIZAR PEDIDO (Auditoria de Pedidos e Baixa de Estoque)
 // ==========================================
-app.post('/api/pedidos', requireAuth, async (req, res) => {
+app.post('/api/pedidos', orderLimiter, requireAuth, async (req, res) => {
   const { nome_cliente, email_cliente, endereco, cidade, cep, itens, telefone, metodo_entrega, metodo_pagamento } = req.body;
   const usuario_id = req.user.id;
 
-  const isEntrega = metodo_entrega === 'entrega';
-  
-  if (!nome_cliente || !telefone || !itens || itens.length === 0) {
+  const allowedMetodosEntrega = ['retirada', 'entrega'];
+  const entregaTipo = allowedMetodosEntrega.includes(metodo_entrega) ? metodo_entrega : 'retirada';
+  const isEntrega = entregaTipo === 'entrega';
+
+  const allowedMetodosPagamento = ['cartão', 'pix', 'espécie', 'não informado'];
+  const pagamentoTipo = allowedMetodosPagamento.includes(metodo_pagamento) ? metodo_pagamento : 'não informado';
+
+  if (!nome_cliente || typeof nome_cliente !== 'string' || !nome_cliente.trim() ||
+      !telefone || typeof telefone !== 'string' || !telefone.trim() ||
+      !Array.isArray(itens) || itens.length === 0 || itens.length > 50) {
     auditService.saveAuditLog(pool, {
       userId: req.user.id,
       userEmail: req.user.email,
@@ -596,10 +789,10 @@ app.post('/api/pedidos', requireAuth, async (req, res) => {
       success: false,
       errorMessage: 'Dados de pedido inválidos.'
     });
-    return res.status(400).json({ error: 'Dados inválidos. Preencha todos os campos obrigatórios e adicione itens.' });
+    return res.status(400).json({ error: 'Dados inválidos. Preencha todos os campos obrigatórios e adicione itens válidos.' });
   }
 
-  if (isEntrega && (!endereco || !cidade || !cep)) {
+  if (isEntrega && (!endereco || !cidade || !cep || typeof endereco !== 'string' || typeof cidade !== 'string' || typeof cep !== 'string')) {
     auditService.saveAuditLog(pool, {
       userId: req.user.id,
       userEmail: req.user.email,
@@ -614,33 +807,74 @@ app.post('/api/pedidos', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Para entrega, preencha o endereço completo.' });
   }
 
+  // Validação estrita de cada item e consolidação de IDs duplicados
+  const itemMap = new Map();
+  for (const item of itens) {
+    if (!item || typeof item !== 'object') {
+      return res.status(400).json({ error: 'Item de pedido malformado.' });
+    }
+    const id = parseInt(item.id, 10);
+    const quantidade = parseInt(item.quantidade, 10);
+
+    if (!Number.isInteger(id) || id <= 0 || !Number.isInteger(quantidade) || quantidade <= 0 || quantidade > 100) {
+      auditService.saveAuditLog(pool, {
+        userId: req.user.id,
+        userEmail: req.user.email,
+        action: 'ORDER_CREATE_REJECTED',
+        resourceType: 'pedido',
+        ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+        userAgent: req.get('user-agent'),
+        requestId: req.requestId,
+        success: false,
+        errorMessage: `Quantidade ou ID inválido para o item: ${item.id}`
+      });
+      return res.status(400).json({ error: 'Quantidade de item inválida. Deve ser um número inteiro positivo.' });
+    }
+
+    itemMap.set(id, (itemMap.get(id) || 0) + quantidade);
+  }
+
   const client = await pool.connect();
   let totalCalculado = 0;
+  const consolidatedItens = [];
 
   try {
     await client.query('BEGIN');
 
-    for (let item of itens) {
-      const prodRes = await client.query('SELECT estoque, preco FROM produtos WHERE id = $1 FOR UPDATE', [item.id]);
-      if (prodRes.rows.length === 0) {
-        throw new Error(`Produto #${item.id} não encontrado.`);
+    for (const [itemId, qtd] of itemMap.entries()) {
+      const prodRes = await client.query('SELECT id, nome, estoque, preco, ativo FROM produtos WHERE id = $1 FOR UPDATE', [itemId]);
+      if (prodRes.rows.length === 0 || !prodRes.rows[0].ativo) {
+        throw new Error(`Produto #${itemId} não encontrado ou inativo.`);
       }
-      if (prodRes.rows[0].estoque < item.quantidade) {
-        throw new Error(`Estoque insuficiente para o presente: ${item.nome}. Disponível: ${prodRes.rows[0].estoque}`);
+      const prod = prodRes.rows[0];
+      if (prod.estoque < qtd) {
+        throw new Error(`Estoque insuficiente para o produto: ${prod.nome}. Disponível: ${prod.estoque}, Solicitado: ${qtd}`);
       }
-      item.precoReal = parseFloat(prodRes.rows[0].preco);
-      totalCalculado += item.precoReal * item.quantidade;
+      const precoUnitario = parseFloat(prod.preco);
+      totalCalculado += precoUnitario * qtd;
+      consolidatedItens.push({
+        id: prod.id,
+        nome: prod.nome,
+        quantidade: qtd,
+        precoReal: precoUnitario
+      });
     }
+
+    const safeNome = nome_cliente.trim().substring(0, 100);
+    const safeTelefone = telefone.trim().substring(0, 30);
+    const safeEndereco = isEntrega ? endereco.trim().substring(0, 200) : 'Retirada';
+    const safeCidade = isEntrega ? cidade.trim().substring(0, 100) : 'Retirada';
+    const safeCep = isEntrega ? cep.trim().substring(0, 20) : '00000-000';
 
     const resultPedido = await client.query(
       `INSERT INTO pedidos (usuario_id, nome_cliente, endereco, cidade, cep, total, telefone, metodo_entrega, metodo_pagamento)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-      [usuario_id, nome_cliente, endereco || 'Retirada', cidade || 'Retirada', cep || '00000-000', totalCalculado, telefone, metodo_entrega, metodo_pagamento || 'não informado']
+      [usuario_id, safeNome, safeEndereco, safeCidade, safeCep, totalCalculado, safeTelefone, entregaTipo, pagamentoTipo]
     );
 
     const pedidoId = resultPedido.rows[0].id;
 
-    for (let item of itens) {
+    for (const item of consolidatedItens) {
       await client.query(
         `INSERT INTO itens_pedido (pedido_id, produto_id, quantidade, preco_unitario)
          VALUES ($1, $2, $3, $4)`,
@@ -663,9 +897,9 @@ app.post('/api/pedidos', requireAuth, async (req, res) => {
       resourceId: pedidoId,
       newValues: {
         total: totalCalculado,
-        metodo_entrega,
-        metodo_pagamento,
-        quantidade_itens: itens.length
+        metodo_entrega: entregaTipo,
+        metodo_pagamento: pagamentoTipo,
+        quantidade_itens: consolidatedItens.length
       },
       ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
       userAgent: req.get('user-agent'),
@@ -676,15 +910,20 @@ app.post('/api/pedidos', requireAuth, async (req, res) => {
     if (email_cliente) {
       try {
         const mensagemLocal = isEntrega 
-          ? `<p>Em breve ele será embalado com muito carinho e enviado para:</p><p> ${endereco}, ${cidade} - ${cep}</p>`
-          : `<p>Seu pedido estará pronto em breve para <strong>Retirada no Local</strong>.</p>`;
+          ? `<p>Em breve ele será embalado com muito carinho e enviado para:</p><p>📍 ${escapeHtml(safeEndereco)}, ${escapeHtml(safeCidade)} - ${escapeHtml(safeCep)}</p>`
+          : `<p>Seu pedido estará pronto em breve para <strong>Retirada no Local</strong>.</p>
+             <p>📍 <strong>Local para Retirada:</strong> <a href="https://maps.app.goo.gl/bJLVbX5qwyjFf67A9" target="_blank" style="color: #c94c65; font-weight: bold; text-decoration: underline;">Abrir localização no Google Maps ↗</a></p>
+             <p style="color: #666; font-size: 0.95em;"><em>Lembramos que o pagamento é realizado presencialmente na retirada.</em></p>`;
 
-        const adminEmail = process.env.ADMIN_EMAIL || 'teste@gmail.com';
+        const adminEmail = process.env.ADMIN_EMAIL;
+        const recipients = [email_cliente];
+        if (adminEmail) recipients.push(adminEmail);
+
         await transporter.sendMail({
           from: `"Presenteie" <${process.env.EMAIL_USER}>`,
-          to: [email_cliente, adminEmail],
+          to: recipients,
           subject: `Pedido #${pedidoId} Confirmado! `,
-          html: `<h1>Obrigado por comprar na Presenteie, ${nome_cliente.split(' ')[0]}!</h1>
+          html: `<h1>Obrigado por comprar na Presenteie, ${escapeHtml(safeNome.split(' ')[0])}!</h1>
                  <p>Seu pedido <strong>#${pedidoId}</strong> no valor de <strong>R$ ${totalCalculado.toFixed(2)}</strong> foi confirmado.</p>
                  ${mensagemLocal}`
         });
@@ -863,7 +1102,7 @@ app.patch('/api/pedidos/:id/status', requireAdmin, async (req, res) => {
         const email = userRes.rows[0].email;
         let subject = '';
         let htmlMessage = '';
-        const nomePrimeiro = pedido.nome_cliente.split(' ')[0];
+        const nomePrimeiro = escapeHtml(pedido.nome_cliente ? pedido.nome_cliente.split(' ')[0] : 'Cliente');
 
         switch (status) {
           case 'pendente':
@@ -985,19 +1224,20 @@ app.get('/api/admin/audit-logs', requireAdmin, async (req, res) => {
 // Middleware Global para Tratamento de Erros
 app.use((err, req, res, next) => {
   logger.error({ err, requestId: req.requestId, endpoint: req.originalUrl }, 'Erro não tratado capturado pelo middleware global');
+  const isDev = process.env.NODE_ENV === 'development';
   res.status(err.status || 500).json({
-    error: err.message || 'Erro interno do servidor',
+    error: isDev ? (err.message || 'Erro interno do servidor') : 'Erro interno do servidor',
     requestId: req.requestId
   });
 });
 
 const PORT = process.env.PORT || 3001;
 
-// Exporta app e pool para poder ser utilizado em testes
+// Exporta app, pool e utilitários para testes
 if (require.main === module) {
   app.listen(PORT, 'localhost', () => {
     logger.info(`Servidor rodando na porta ${PORT} em localhost`);
   });
 }
 
-module.exports = { app, pool };
+module.exports = { app, pool, escapeHtml };
