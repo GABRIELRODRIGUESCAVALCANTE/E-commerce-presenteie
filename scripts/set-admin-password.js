@@ -94,4 +94,3 @@ async function setAdminPassword() {
 }
 
 setAdminPassword();
-1

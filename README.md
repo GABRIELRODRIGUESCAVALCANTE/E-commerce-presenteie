@@ -120,4 +120,37 @@ npm run dev
 Pronto! O app estará disponível no navegador em `http://localhost:5173`.
 
 ---
+
+## 🐳 Como Rodar com Docker
+
+O projeto já possui suporte completo a containers com **Docker** e **Docker Compose**, incluindo o banco PostgreSQL, Backend Node.js e Frontend com Nginx:
+
+### 1. Subir toda a stack com Docker Compose
+```bash
+# Constrói as imagens e inicia os containers em segundo plano
+docker compose up --build -d
+
+# Para visualizar os logs em tempo real
+docker compose logs -f
+
+# Para parar a aplicação
+docker compose down
+```
+
+A aplicação ficará disponível em:
+- **Frontend:** `http://localhost:5173`
+- **Backend API:** `http://localhost:3001/api`
+- **PostgreSQL:** `localhost:5432`
+
+### 2. Gerar imagens Docker individualmente
+
+```bash
+# Imagem do Backend
+docker build -t presenteie-backend:latest .
+
+# Imagem do Frontend
+docker build -t presenteie-frontend:latest ./front
+```
+
+---
 Feito com 💖 para entregar a melhor experiência de compra!
