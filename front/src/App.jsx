@@ -803,12 +803,12 @@ const Admin = () => {
           ) : (
             <div className="pedidos-list">
               {produtos.map(p => (
-                <div key={p.id} className="pedido-card" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div key={p.id} className="pedido-card admin-estoque-card">
                   <div>
                     <h4 style={{ margin: 0 }}>{p.nome}</h4>
                     <p style={{ margin: 0, fontSize: '0.9rem', color: 'var(--color-text-muted)' }}>Preço: {formatPreco(p.preco)}</p>
                   </div>
-                  <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                  <div className="admin-estoque-actions">
                     <label style={{ fontWeight: 'bold' }}>Estoque:</label>
                     <input
                       type="number"
