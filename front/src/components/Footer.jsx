@@ -1,67 +1,64 @@
 import { Link } from 'react-router-dom';
+import Icon, { WhatsAppIcon } from './Icon';
+import { STORE, whatsappLink } from '../config/store';
 
-const Footer = () => {
+export default function Footer() {
   return (
-    <footer className="footer-premium">
-      <div className="footer-grid">
-        <div className="footer-col">
-          <h3 style={{ fontFamily: 'var(--font-heading)', fontSize: '1.5rem', marginBottom: '1rem' }}>Presenteie </h3>
-          <p style={{ color: 'var(--color-text-muted)', fontSize: '0.95rem', lineHeight: '1.6' }}>
-            Transformando momentos comuns em lembranças inesquecíveis. O melhor lugar para encontrar presentes com significado.
-          </p>
+    <footer className="site-footer">
+      <div className="container site-footer__grid">
+        <div className="site-footer__brand">
+          <Link to="/" className="logo logo--light">
+            <span className="logo__mark"><Icon name="gift" size={20} strokeWidth={2} /></span>
+            <span className="logo__text">presenteie</span>
+          </Link>
+          <p>Transformando momentos comuns em lembranças inesquecíveis. O melhor lugar para encontrar presentes com significado.</p>
         </div>
-        <div className="footer-col">
-          <h4 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: 'var(--color-primary-dark)' }}>Atendimento</h4>
-          <p style={{ color: 'var(--color-text-muted)', fontSize: '0.95rem', lineHeight: '1.6' }}>
-            Dúvidas ou pedidos especiais? Fale conosco:
-          </p>
-          <a
-            href="https://wa.me/5585992251640?text=Ol%C3%A1!%20Gostaria%20de%20tirar%20algumas%20d%C3%BAvidas%20sobre%20os%20presentes."
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '8px',
-              marginTop: '0.5rem',
-              color: '#25D366',
-              fontWeight: 600,
-              textDecoration: 'none'
-            }}
-          >
-            <span>💬 (85) 99225-1640</span>
-          </a>
+
+        <div>
+          <h2 className="site-footer__title">Navegação</h2>
+          <ul className="site-footer__links">
+            <li><Link to="/">Início</Link></li>
+            <li><Link to="/#catalogo">Todos os presentes</Link></li>
+            <li><Link to="/carrinho">Carrinho</Link></li>
+            <li><Link to="/meus-pedidos">Meus pedidos</Link></li>
+          </ul>
         </div>
-        <div className="footer-col">
-          <h4 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: 'var(--color-primary-dark)' }}>📍 Retirada</h4>
-          <p style={{ color: 'var(--color-text-muted)', fontSize: '0.95rem', lineHeight: '1.6' }}>
-            Pagamento e retirada presenciais.
-          </p>
-          <a
-            href="https://maps.app.goo.gl/bJLVbX5qwyjFf67A9"
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '6px',
-              marginTop: '0.5rem',
-              color: 'var(--color-primary)',
-              fontWeight: 600,
-              fontSize: '0.95rem',
-              textDecoration: 'underline'
-            }}
-          >
-            Ver no Google Maps ↗
-          </a>
+
+        <div>
+          <h2 className="site-footer__title">Atendimento</h2>
+          <ul className="site-footer__links">
+            <li>
+              <a href={whatsappLink('Olá! Gostaria de tirar algumas dúvidas sobre os presentes.')} target="_blank" rel="noopener noreferrer">
+                <WhatsAppIcon size={18} /> {STORE.whatsappDisplay}
+              </a>
+            </li>
+            <li className="site-footer__note">Dúvidas ou pedidos especiais? Fale com a gente pelo WhatsApp.</li>
+          </ul>
+        </div>
+
+        <div>
+          <h2 className="site-footer__title">Retirada e pagamento</h2>
+          <ul className="site-footer__links">
+            <li>
+              <a href={STORE.mapsUrl} target="_blank" rel="noopener noreferrer">
+                <Icon name="mapPin" size={18} /> Ver no Google Maps
+              </a>
+            </li>
+            <li className="site-footer__note">Pagamento e retirada presenciais.</li>
+            <li className="site-footer__payments" aria-label="Formas de pagamento aceitas">
+              <span><Icon name="card" size={16} /> Cartão</span>
+              <span><Icon name="pix" size={16} /> PIX</span>
+              <span><Icon name="cash" size={16} /> Dinheiro</span>
+            </li>
+          </ul>
         </div>
       </div>
-      
-      <div className="footer-bottom">
-        <p>&copy; {new Date().getFullYear()} Presenteie. Todos os direitos reservados.</p>
+
+      <div className="site-footer__bottom">
+        <div className="container">
+          <p>&copy; {new Date().getFullYear()} Presenteie. Todos os direitos reservados.</p>
+        </div>
       </div>
     </footer>
   );
-};
-
-export default Footer;
+}

@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /checkout
+Disallow: /carrinho
+Disallow: /meus-pedidos
+Disallow: /redefinir-senha
