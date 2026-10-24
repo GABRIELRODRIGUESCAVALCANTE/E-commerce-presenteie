@@ -1,16 +1,24 @@
-# React + Vite
+# Presenteie — Front-end
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+SPA em React 19 + Vite, sem bibliotecas de UI: os componentes e o design system ficam em `src/components` e `src/styles`.
 
-Currently, two official plugins are available:
+## Scripts
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+```bash
+npm run dev      # servidor de desenvolvimento (http://localhost:5173)
+npm run build    # build de produção em dist/
+npm run lint     # oxlint
+npm run preview  # serve o build localmente
+```
 
-## React Compiler
+Configure `VITE_API_URL` em `.env` (veja `.env.example`).
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Convenções
 
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+- **Estilos:** use os tokens de `src/styles/tokens.css` (cores, espaçamentos, raios, sombras). Classes seguem o padrão BEM (`bloco__elemento--modificador`).
+- **Botões:** `btn` + variante (`btn--primary`, `btn--secondary`, `btn--ghost`, `btn--danger`) + tamanho opcional (`btn--sm`, `btn--lg`, `btn--block`).
+- **Formulários:** envolva o controle em `<Field label hint error>`; ele associa rótulo, dica e erro ao input (acessibilidade).
+- **API:** chame os endpoints por `src/api/index.js` e exiba erros com `getErrorMessage(err)`.
+- **Estado global:** `useCart()`, `useAuth()` e `useToast()` (providers em `src/context`).
+- **Imagens:** use `imageUrl(url, largura)`; fotos do Cloudinary recebem formato/qualidade automáticos e redimensionamento.
+- **SEO:** cada página define título/descrição com `usePageMeta(titulo, descricao)`.

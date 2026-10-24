@@ -5,6 +5,8 @@ WORKDIR /app
 
 # Definir ambiente para produção
 ENV NODE_ENV=production
+# Escutar em todas as interfaces para a API ser acessível fora do container
+ENV HOST=0.0.0.0
 
 # Copiar arquivos de manifesto de dependências
 COPY package*.json ./
