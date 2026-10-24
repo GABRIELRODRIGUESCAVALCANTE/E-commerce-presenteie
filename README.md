@@ -176,12 +176,22 @@ Pronto! O app estará disponível no navegador em `http://localhost:5173`.
 
 ---
 
+## ☁️ Deploy em produção
+
+Passo a passo completo para subir em uma instância nova da Oracle Cloud (Ubuntu + Docker + nginx + HTTPS): veja **[DEPLOY.md](DEPLOY.md)**.
+
+---
+
 ## 🐳 Como Rodar com Docker
 
 O projeto já possui suporte completo a containers com **Docker** e **Docker Compose**, incluindo o banco PostgreSQL, Backend Node.js e Frontend com Nginx:
 
 ### 1. Subir toda a stack com Docker Compose
 ```bash
+# Crie o .env a partir do exemplo e defina BETTER_AUTH_SECRET (obrigatório)
+cp .env.docker.example .env
+sed -i "s/^BETTER_AUTH_SECRET=.*/BETTER_AUTH_SECRET=$(openssl rand -hex 32)/" .env
+
 # Constrói as imagens e inicia os containers em segundo plano
 docker compose up --build -d
 

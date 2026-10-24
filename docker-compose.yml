@@ -8,8 +8,9 @@ services:
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
       POSTGRES_DB: ${DB_NAME:-presenteie}
+    # Publicado apenas em localhost: o banco nunca fica exposto na internet
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -37,7 +38,7 @@ services:
       DB_SSL: "false"
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
       BACKEND_URL: ${BACKEND_URL:-http://localhost:3001}
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-presenteie_super_secret_docker_key_12345}
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?Defina BETTER_AUTH_SECRET no arquivo .env - gere com openssl rand -hex 32}"
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@presenteie.com}
       CLOUDINARY_CLOUD_NAME: ${CLOUDINARY_CLOUD_NAME:-}
       CLOUDINARY_API_KEY: ${CLOUDINARY_API_KEY:-}
@@ -48,8 +49,9 @@ services:
       EMAIL_PASS: ${EMAIL_PASS:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-90}
+    # Em produção o nginx do servidor faz o proxy de https://seudominio/api para esta porta
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
     depends_on:
       db:
         condition: service_healthy
@@ -60,11 +62,12 @@ services:
       context: ./front
       dockerfile: Dockerfile
       args:
-        VITE_API_URL: http://localhost:3001/api
+        # Em produção: https://seudominio.com.br/api (definido no .env)
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:3001/api}
     container_name: presenteie-frontend
     restart: unless-stopped
     ports:
-      - "5173:80"
+      - "127.0.0.1:5173:80"
     depends_on:
       - backend
 
