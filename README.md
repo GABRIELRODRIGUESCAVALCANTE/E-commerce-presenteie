@@ -22,8 +22,8 @@ Um E-commerce completo, seguro e moderno, focado em presentes personalizados e r
 - **React.js:** Componentização da interface.
 - **Vite:** Compilador HMR ultrarrápido para desenvolvimento.
 - **Axios:** Cliente HTTP com suporte a *Credentials* em cross-origin (CORS).
-- **React Router Dom:** Navegação de página única (SPA).
-- **CSS Vanilla Premium:** Estilização baseada em tokens com animações suaves e design moderno, totalmente responsivo.
+- **React Router Dom:** Navegação de página única (SPA) com URLs compartilháveis (busca, filtros e produtos).
+- **CSS com Design Tokens:** Paleta com contraste AA, tipografia Fraunces + Inter, componentes padronizados e layout responsivo (mobile first).
 
 ---
 
@@ -36,7 +36,44 @@ Um E-commerce completo, seguro e moderno, focado em presentes personalizados e r
 - **Zero Vazamento de Credenciais:** As credenciais críticas ficam retidas em variáveis de ambiente `.env`.
 - **Exclusões Seguras (Soft-Deletes):** A exclusão de produtos arquiva o item (`ativo = false`), preservando relacionamentos contábeis em `itens_pedido`.
 
-Para documentação completa sobre o sistema de auditoria e logs, veja [AUDIT.md](file:///home/gabriel/Documents/Projeto-presenteie/AUDIT.md).
+- **Verificação de E-mail no Servidor:** O cadastro por e-mail/senha só é aceito pelo Better Auth após a validação do código OTP (antes a checagem existia apenas no front-end).
+- **Rate limiting por contexto:** Limite restrito em login, cadastro e redefinição de senha; consultas de sessão usam o limite global.
+
+Para documentação completa sobre o sistema de auditoria e logs, veja [AUDIT.md](AUDIT.md).
+
+---
+
+## 🗂️ Estrutura do Projeto
+
+```
+├── server.js                 # API Express (rotas, Better Auth, regras de pedido)
+├── lib/ middleware/ services/ # Logger, requestId e auditoria
+├── migrations/               # SQL idempotente (schema da loja, auditoria, OTP)
+├── scripts/                  # migrate.js e set-admin-password.js
+├── tests/                    # node:test + supertest (unitários e integração)
+└── front/
+    ├── index.html            # Metadados de SEO/compartilhamento
+    ├── nginx.conf            # Servidor de produção (cache e cabeçalhos de segurança)
+    └── src/
+        ├── api/              # Cliente axios e funções de cada endpoint
+        ├── components/       # Header, Footer, ProductCard, CartDrawer, Field, Icon...
+        ├── context/          # Providers: Auth, Cart, Toast
+        ├── hooks/            # useCart, useAuth, useToast, useDialog, usePageMeta...
+        ├── pages/            # Home, ProductPage, CartPage, Checkout, Auth, MyOrders, admin/
+        ├── styles/           # tokens.css, base.css, components.css, pages.css
+        └── utils/            # Formatação, imagens otimizadas, máscaras
+```
+
+### Páginas do front-end
+
+| Rota | Descrição |
+| :--- | :--- |
+| `/` | Vitrine com busca (`?busca=`), categoria (`?categoria=`) e ordenação (`?ordem=`) |
+| `/produto/:id/:slug` | Página do produto (URL compartilhável, produtos relacionados) |
+| `/carrinho` · `/checkout` · `/pedido-confirmado` | Fluxo de compra com retirada no local |
+| `/auth` · `/esqueci-senha` · `/redefinir-senha` | Login, cadastro com OTP, Google e recuperação de senha |
+| `/meus-pedidos` | Histórico com linha do tempo do status |
+| `/admin` | Painel (pedidos, estoque, novo produto) — carregado sob demanda |
 
 ---
 
@@ -90,20 +127,38 @@ GOOGLE_CLIENT_SECRET=seu_secret
 ADMIN_EMAIL=seu_email@gmail.com
 EMAIL_USER=seu_email@gmail.com
 EMAIL_PASS=sua_senha_de_app_do_gmail
+
+# Cloudinary (upload das fotos dos produtos)
+CLOUDINARY_CLOUD_NAME=seu_cloud_name
+CLOUDINARY_API_KEY=sua_api_key
+CLOUDINARY_API_SECRET=seu_api_secret
 ```
+
+No front-end, crie `front/.env` a partir de `front/.env.example` (apenas `VITE_API_URL`). O acesso ao painel admin é decidido pelo back-end (`ADMIN_EMAIL`), então `VITE_ADMIN_EMAIL` não é mais necessário.
 
 ### 3. Migrations e Banco de Dados
 
 ```bash
-# Executa as migrations para criar as tabelas de auditoria e controle
+# Cria/atualiza as tabelas do Better Auth, da loja (categorias, produtos, pedidos),
+# de auditoria e de verificação de e-mail. Tudo é idempotente e também roda no startup.
 npm run migrate
+```
+
+### Definindo a senha do administrador
+
+```bash
+# A senha nunca deve ficar escrita no código. Sem e-mails, usa ADMIN_EMAIL do .env.
+NEW_ADMIN_PASSWORD='uma-senha-forte' npm run set-admin-password -- admin@seudominio.com
 ```
 
 ### 4. Executando os Testes
 
 ```bash
-# Roda a suíte de testes de auditoria e segurança
+# Roda a suíte de testes (unitários + integração). Requer o PostgreSQL configurado no .env.
 npm test
+
+# Front-end: lint e build de produção
+cd front && npm run lint && npm run build
 ```
 
 ### 5. Rodando os Servidores

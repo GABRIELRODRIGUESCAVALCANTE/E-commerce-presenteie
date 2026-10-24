@@ -2,9 +2,32 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
+const { getMigrations } = require('better-auth/db/migration');
 const logger = require('../lib/logger');
 
-async function runMigrations(externalPool) {
+/**
+ * Cria as tabelas do Better Auth (user, session, account, verification) caso ainda não existam.
+ * Apenas cria tabelas/colunas ausentes; nunca remove ou altera dados existentes.
+ */
+async function runAuthMigrations(pool, authOptions) {
+  const { toBeCreated, toBeAdded, runMigrations: applyAuthMigrations } = await getMigrations({
+    ...authOptions,
+    database: pool
+  });
+
+  if (toBeCreated.length === 0 && toBeAdded.length === 0) {
+    logger.debug('Schema do Better Auth já está atualizado.');
+    return;
+  }
+
+  logger.info({
+    criarTabelas: toBeCreated.map(t => t.table),
+    adicionarColunas: toBeAdded.map(t => t.table)
+  }, 'Aplicando migrations do Better Auth');
+  await applyAuthMigrations();
+}
+
+async function runMigrations(externalPool, { authOptions = {} } = {}) {
   const pool = externalPool || new Pool({
     user: process.env.DB_USER,
     host: process.env.DB_HOST,
@@ -12,6 +35,8 @@ async function runMigrations(externalPool) {
     password: process.env.DB_PASSWORD,
     port: process.env.DB_PORT,
   });
+
+  await runAuthMigrations(pool, authOptions);
 
   const client = await pool.connect();
 
@@ -56,7 +81,7 @@ async function runMigrations(externalPool) {
 
     logger.info('Todas as migrations estão atualizadas.');
   } catch (error) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
     logger.error({ err: error }, 'Erro ao executar migrations');
     throw error;
   } finally {

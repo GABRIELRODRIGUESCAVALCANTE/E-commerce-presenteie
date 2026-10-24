@@ -28,6 +28,34 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;');
 }
 
+/**
+ * Metadados da requisição usados nos registros de auditoria.
+ */
+function requestMeta(req) {
+  return {
+    ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+    userAgent: req.get('user-agent'),
+    requestId: req.requestId
+  };
+}
+
+function isAdminEmail(email) {
+  const adminEmail = process.env.ADMIN_EMAIL;
+  return Boolean(adminEmail && email && email.toLowerCase() === adminEmail.toLowerCase());
+}
+
+function formatBRL(valor) {
+  return Number(valor).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+}
+
+function parsePositiveInt(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+// Erros de regra de negócio cuja mensagem pode ser exibida ao cliente
+class BusinessError extends Error {}
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -43,7 +71,9 @@ const upload = multer({
     if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Tipo de arquivo não permitido. Use JPG, PNG, WEBP ou GIF.'));
+      const err = new Error('Tipo de arquivo não permitido. Use JPG, PNG, WEBP ou GIF.');
+      err.status = 400;
+      cb(err);
     }
   }
 });
@@ -101,13 +131,24 @@ const pool = new Pool({
   ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : undefined
 });
 
-// Executa migrations do banco de forma automática e não-bloqueante na inicialização
-runMigrations(pool).catch(err => {
-  logger.error({ err }, 'Erro ao executar migrations automáticas no startup');
-});
-
 const { betterAuth } = require('better-auth');
 const { toNodeHandler } = require('better-auth/node');
+const { createAuthMiddleware, APIError } = require('better-auth/api');
+
+/**
+ * Indica se o e-mail teve um código OTP validado nos últimos 30 minutos.
+ * Garante no servidor que o cadastro por e-mail/senha só aconteça após a verificação.
+ */
+async function hasRecentEmailVerification(email) {
+  if (typeof email !== 'string' || !email.trim()) return false;
+  const result = await pool.query(
+    `SELECT 1 FROM email_verifications
+     WHERE LOWER(email) = $1 AND verified_at IS NOT NULL AND verified_at > NOW() - INTERVAL '30 minutes'
+     LIMIT 1`,
+    [email.trim().toLowerCase()]
+  );
+  return result.rows.length > 0;
+}
 
 // Inicializando o Better Auth com a sua conexão Postgres
 const auth = betterAuth({
@@ -115,6 +156,36 @@ const auth = betterAuth({
   emailAndPassword: {
     enabled: true,
     minPasswordLength: 8,
+    resetPasswordTokenExpiresIn: 60 * 60,
+    revokeSessionsOnPasswordReset: true,
+    sendResetPassword: async ({ user, url }) => {
+      const safeFirstName = escapeHtml(user.name ? user.name.split(' ')[0] : 'Cliente');
+      // Envio sem bloquear a resposta (evita revelar, pelo tempo de resposta, se o e-mail existe)
+      transporter.sendMail({
+        from: `"Presenteie" <${process.env.EMAIL_USER}>`,
+        to: user.email,
+        subject: 'Redefinição de senha — Presenteie',
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 24px; border: 1px solid #f0e6e8; border-radius: 12px; background-color: #fff;">
+            <h2 style="color: #9e3b52; margin-bottom: 8px;">Olá, ${safeFirstName}!</h2>
+            <p style="color: #555; font-size: 15px;">Recebemos um pedido para redefinir a senha da sua conta na Presenteie.</p>
+            <p style="text-align: center; margin: 28px 0;">
+              <a href="${escapeHtml(url)}" style="background: #9e3b52; color: #fff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold;">Criar nova senha</a>
+            </p>
+            <p style="color: #777; font-size: 13px;">O link expira em <strong>1 hora</strong>. Se você não fez esse pedido, ignore este e-mail — sua senha continua a mesma.</p>
+          </div>`
+      }).catch((err) => logger.error({ err, userId: user.id }, 'Erro ao enviar e-mail de redefinição de senha'));
+    },
+  },
+  hooks: {
+    before: createAuthMiddleware(async (ctx) => {
+      if (ctx.path !== '/sign-up/email') return;
+      if (!(await hasRecentEmailVerification(ctx.body?.email))) {
+        throw new APIError('BAD_REQUEST', {
+          message: 'Confirme seu e-mail com o código de verificação antes de criar a conta.'
+        });
+      }
+    }),
   },
   socialProviders: {
     google: {
@@ -125,10 +196,18 @@ const auth = betterAuth({
   databaseHooks: {
     user: {
       create: {
+        // O hook "before" acima já exigiu a verificação OTP para cadastros por e-mail/senha
+        before: async (user, ctx) => {
+          if (ctx?.path === '/sign-up/email') {
+            return { data: { ...user, emailVerified: true } };
+          }
+        },
         after: async (user) => {
+          pool.query('DELETE FROM email_verifications WHERE LOWER(email) = $1', [String(user.email).toLowerCase()])
+            .catch((err) => logger.error({ err, userId: user.id }, 'Erro ao limpar verificações de e-mail'));
           try {
             const safeFirstName = escapeHtml(user.name ? user.name.split(' ')[0] : 'Cliente');
-            await transporter.sendMail({
+            transporter.sendMail({
               from: `"Presenteie" <${process.env.EMAIL_USER}>`,
               to: user.email,
               subject: `Bem-vindo(a) à Presenteie! 🎉`,
@@ -137,7 +216,7 @@ const auth = betterAuth({
                      <p>A <strong>Presenteie</strong> foi criada para te ajudar a encontrar os melhores presentes para quem você ama.</p>
                      <p>Explore nossa vitrine e fique à vontade para entrar em contato se precisar de ajuda!</p>
                      <br><p>Com carinho,<br>Equipe Presenteie</p>`
-            });
+            }).catch((err) => logger.error({ err, userId: user.id }, 'Erro ao enviar e-mail de boas-vindas'));
           } catch (err) {
             logger.error({ err, userId: user.id }, "Erro ao enviar e-mail de boas-vindas");
           }
@@ -155,6 +234,11 @@ const auth = betterAuth({
   secret: process.env.BETTER_AUTH_SECRET,
   baseURL: process.env.BACKEND_URL || "http://localhost:3001",
   trustedOrigins: [process.env.FRONTEND_URL || "http://localhost:5173"]
+});
+
+// Executa migrations do banco (Better Auth + SQL) de forma automática e não-bloqueante na inicialização
+runMigrations(pool, { authOptions: auth.options }).catch(err => {
+  logger.error({ err }, 'Erro ao executar migrations automáticas no startup');
 });
 
 // Rota de teste da API
@@ -201,8 +285,7 @@ const requireAdmin = async (req, res, next) => {
     }
     
     req.user = session.user;
-    const adminEmail = process.env.ADMIN_EMAIL;
-    if (!adminEmail || session.user.email.toLowerCase() !== adminEmail.toLowerCase()) {
+    if (!isAdminEmail(session.user.email)) {
       auditService.logSecurityEvent(pool, req, 'FORBIDDEN_ACCESS_ATTEMPT', {
         resourceType: 'admin',
         resourceId: req.originalUrl,
@@ -229,21 +312,39 @@ app.get('/api/db-test', requireAdmin, async (req, res) => {
   }
 });
 
+// Dados da sessão atual + permissão de admin (usado pelo front-end para exibir o painel)
+app.get('/api/me', requireAuth, (req, res) => {
+  const { id, name, email, image } = req.user;
+  res.json({ user: { id, name, email, image }, isAdmin: isAdminEmail(email) });
+});
+
+const PRODUCT_SORTS = {
+  recentes: 'p.id DESC',
+  menor_preco: 'p.preco ASC, p.id DESC',
+  maior_preco: 'p.preco DESC, p.id DESC',
+  nome: 'p.nome ASC, p.id DESC'
+};
+
+async function sessionIsAdmin(req) {
+  try {
+    const session = await auth.api.getSession({ headers: req.headers });
+    return isAdminEmail(session?.user?.email);
+  } catch {
+    return false;
+  }
+}
+
 // Lista produtos cadastrados no banco
 app.get('/api/produtos', async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 12;
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 100);
     const offset = (page - 1) * limit;
-    const busca = req.query.busca || '';
+    const busca = String(req.query.busca || '').trim().substring(0, 100);
     const categoria = req.query.categoria || 'todas';
-    
-    let isAdmin = false;
-    try {
-      const session = await auth.api.getSession({ headers: req.headers });
-      const adminEmail = process.env.ADMIN_EMAIL;
-      isAdmin = Boolean(adminEmail && session?.user?.email?.toLowerCase() === adminEmail.toLowerCase());
-    } catch (err) {}
+    const orderBy = PRODUCT_SORTS[req.query.ordem] || PRODUCT_SORTS.recentes;
+
+    const isAdmin = await sessionIsAdmin(req);
 
     let queryStr = `
       SELECT p.*, c.nome AS categoria_nome, count(*) over() as total_count
@@ -259,19 +360,23 @@ app.get('/api/produtos', async (req, res) => {
     }
 
     if (busca) {
-      const sanitizedBusca = String(busca).replace(/[%_\\]/g, '\\$&');
+      const sanitizedBusca = busca.replace(/[%_\\]/g, '\\$&');
       queryStr += ` AND (p.nome ILIKE $${paramIndex} OR p.descricao ILIKE $${paramIndex})`;
       values.push(`%${sanitizedBusca}%`);
       paramIndex++;
     }
 
     if (categoria && categoria !== 'todas') {
+      const categoriaId = parsePositiveInt(categoria);
+      if (!categoriaId) {
+        return res.status(400).json({ error: 'Categoria inválida.' });
+      }
       queryStr += ` AND p.categoria_id = $${paramIndex}`;
-      values.push(categoria);
+      values.push(categoriaId);
       paramIndex++;
     }
 
-    queryStr += ` ORDER BY p.id DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    queryStr += ` ORDER BY ${orderBy} LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
     values.push(limit, offset);
 
     const result = await pool.query(queryStr, values);
@@ -287,6 +392,31 @@ app.get('/api/produtos', async (req, res) => {
   } catch (err) {
     logger.error({ err, requestId: req.requestId }, 'Erro ao buscar produtos');
     res.status(500).json({ erro: 'Erro ao buscar produtos' });
+  }
+});
+
+// Detalhes de um produto ativo (inclui produtos esgotados, para links compartilhados continuarem funcionando)
+app.get('/api/produtos/:id', async (req, res) => {
+  const id = parsePositiveInt(req.params.id);
+  if (!id) {
+    return res.status(400).json({ error: 'Produto inválido.' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT p.*, c.nome AS categoria_nome
+       FROM produtos p
+       LEFT JOIN categorias c ON p.categoria_id = c.id
+       WHERE p.id = $1 AND p.ativo = true`,
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Produto não encontrado.' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    logger.error({ err, requestId: req.requestId }, 'Erro ao buscar produto');
+    res.status(500).json({ error: 'Erro ao buscar produto.' });
   }
 });
 
@@ -369,9 +499,7 @@ app.post('/api/auth/send-verification-code', verificationLimiter, async (req, re
       userEmail: emailTrimmed,
       action: 'VERIFICATION_CODE_SENT',
       resourceType: 'auth',
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: true
     });
 
@@ -398,7 +526,7 @@ app.post('/api/auth/verify-code', verificationLimiter, async (req, res) => {
 
     const verificationRecord = await pool.query(
       `SELECT * FROM email_verifications 
-       WHERE LOWER(email) = $1 AND expires_at > NOW()
+       WHERE LOWER(email) = $1 AND expires_at > NOW() AND verified_at IS NULL
        ORDER BY id DESC LIMIT 1`,
       [emailTrimmed]
     );
@@ -421,16 +549,14 @@ app.post('/api/auth/verify-code', verificationLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Código incorreto. Verifique seu e-mail e tente novamente.' });
     }
 
-    // Sucesso na validação - remove o registro de verificação
-    await pool.query('DELETE FROM email_verifications WHERE id = $1', [record.id]);
+    // Sucesso na validação - marca o e-mail como verificado (exigido pelo cadastro no Better Auth)
+    await pool.query('UPDATE email_verifications SET verified_at = NOW() WHERE id = $1', [record.id]);
 
     auditService.saveAuditLog(pool, {
       userEmail: emailTrimmed,
       action: 'EMAIL_VERIFIED_SUCCESS',
       resourceType: 'auth',
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: true
     });
 
@@ -444,10 +570,21 @@ app.post('/api/auth/verify-code', verificationLimiter, async (req, res) => {
 // ==========================================
 // ROTAS DE AUTENTICAÇÃO (Better Auth + Interceptor de Auditoria)
 // ==========================================
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Muitas tentativas de login' } });
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Muitas tentativas. Aguarde alguns minutos e tente novamente.' } });
 
-app.all("/api/auth/*path", authLimiter, (req, res, next) => {
-  const pathStr = req.params.path || req.path || '';
+// O limite restrito vale apenas para operações sensíveis (login, cadastro, senha).
+// Consultas de sessão (get-session) acontecem a cada carregamento de página e usam o limite global.
+const SENSITIVE_AUTH_PATH = /^\/(sign-in|sign-up|request-password-reset|reset-password|change-password)/;
+const sensitiveAuthLimiter = (req, res, next) => {
+  const authPath = req.path.replace(/^\/api\/auth/, '');
+  if (req.method === 'POST' && SENSITIVE_AUTH_PATH.test(authPath)) {
+    return authLimiter(req, res, next);
+  }
+  next();
+};
+
+app.all("/api/auth/*path", sensitiveAuthLimiter, (req, res, next) => {
+  const pathStr = req.path.replace(/^\/api\/auth/, '');
 
   res.on('finish', () => {
     const success = res.statusCode < 400;
@@ -499,7 +636,7 @@ app.all("/api/auth/*path", authLimiter, (req, res, next) => {
 // ==========================================
 app.get('/api/categorias', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM categorias');
+    const result = await pool.query('SELECT * FROM categorias ORDER BY nome ASC');
     res.json(result.rows);
   } catch (err) {
     logger.error({ err, requestId: req.requestId }, 'Erro ao buscar categorias');
@@ -508,8 +645,13 @@ app.get('/api/categorias', async (req, res) => {
 });
 
 app.post('/api/categorias', requireAdmin, async (req, res) => {
+  const nome = typeof req.body?.nome === 'string' ? req.body.nome.trim() : '';
+  const descricao = typeof req.body?.descricao === 'string' ? req.body.descricao.trim().substring(0, 500) : null;
+  if (!nome || nome.length > 100) {
+    return res.status(400).json({ error: 'Informe um nome de categoria com até 100 caracteres.' });
+  }
+
   try {
-    const { nome, descricao } = req.body;
     const result = await pool.query(
       'INSERT INTO categorias (nome, descricao) VALUES ($1, $2) RETURNING *',
       [nome, descricao]
@@ -523,9 +665,7 @@ app.post('/api/categorias', requireAdmin, async (req, res) => {
       resourceType: 'categoria',
       resourceId: novaCategoria.id,
       newValues: { nome: novaCategoria.nome, descricao: novaCategoria.descricao },
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: true
     });
 
@@ -538,9 +678,7 @@ app.post('/api/categorias', requireAdmin, async (req, res) => {
       action: 'CATEGORY_CREATE_FAILED',
       resourceType: 'categoria',
       newValues: { nome: req.body?.nome },
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: false,
       errorMessage: err.message
     });
@@ -552,9 +690,47 @@ app.post('/api/categorias', requireAdmin, async (req, res) => {
 // ROTAS DE PRODUTOS (Criar, Estoque, Excluir)
 // ==========================================
 
+/**
+ * Valida e normaliza os campos de um produto enviados pelo painel administrativo.
+ * Retorna { error } em caso de dado inválido, ou { data } com os valores prontos para o banco.
+ */
+function validateProductInput(body = {}) {
+  const nome = typeof body.nome === 'string' ? body.nome.trim() : '';
+  if (!nome || nome.length > 150) {
+    return { error: 'Informe o nome do produto (até 150 caracteres).' };
+  }
+
+  const preco = Number(String(body.preco ?? '').replace(',', '.'));
+  if (!Number.isFinite(preco) || preco < 0 || preco > 1000000) {
+    return { error: 'Informe um preço válido.' };
+  }
+
+  const estoque = Number(body.estoque);
+  if (!Number.isInteger(estoque) || estoque < 0 || estoque > 1000000) {
+    return { error: 'O estoque deve ser um número inteiro maior ou igual a zero.' };
+  }
+
+  let categoriaId = null;
+  if (body.categoria_id !== undefined && body.categoria_id !== null && body.categoria_id !== '') {
+    categoriaId = parsePositiveInt(body.categoria_id);
+    if (!categoriaId) return { error: 'Categoria inválida.' };
+  }
+
+  const descricao = typeof body.descricao === 'string' ? body.descricao.trim().substring(0, 2000) : null;
+
+  return {
+    data: { nome, descricao, preco: Math.round(preco * 100) / 100, estoque, categoriaId }
+  };
+}
+
 app.post('/api/produtos', requireAdmin, upload.single('imagem'), async (req, res) => {
+  const validation = validateProductInput(req.body);
+  if (validation.error) {
+    return res.status(400).json({ error: validation.error });
+  }
+
   try {
-    const { categoria_id, nome, descricao, preco, estoque } = req.body;
+    const { nome, descricao, preco, estoque, categoriaId: catId } = validation.data;
     let imagem_url = null;
 
     if (req.file) {
@@ -571,8 +747,6 @@ app.post('/api/produtos', requireAdmin, upload.single('imagem'), async (req, res
         imagem_url = urlStr;
       }
     }
-
-    const catId = categoria_id ? categoria_id : null;
 
     const result = await pool.query(
       'INSERT INTO produtos (categoria_id, nome, descricao, preco, estoque, imagem_url) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
@@ -594,14 +768,15 @@ app.post('/api/produtos', requireAdmin, upload.single('imagem'), async (req, res
         estoque: produto.estoque,
         imagem_url: produto.imagem_url
       },
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: true
     });
 
     res.status(201).json(produto);
   } catch (err) {
+    if (err.code === '23503') {
+      return res.status(400).json({ error: 'A categoria selecionada não existe.' });
+    }
     logger.error({ err, requestId: req.requestId }, 'Erro ao criar produto');
     auditService.saveAuditLog(pool, {
       userId: req.user?.id,
@@ -609,9 +784,7 @@ app.post('/api/produtos', requireAdmin, upload.single('imagem'), async (req, res
       action: 'PRODUCT_CREATE_FAILED',
       resourceType: 'produto',
       newValues: { nome: req.body?.nome },
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: false,
       errorMessage: err.message
     });
@@ -623,7 +796,8 @@ app.patch('/api/produtos/:id/estoque', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { estoque } = req.body;
 
-  if (estoque === undefined || isNaN(estoque) || estoque < 0) {
+  const novoEstoque = Number(estoque);
+  if (!parsePositiveInt(id) || estoque === null || estoque === '' || !Number.isInteger(novoEstoque) || novoEstoque < 0 || novoEstoque > 1000000) {
     auditService.saveAuditLog(pool, {
       userId: req.user.id,
       userEmail: req.user.email,
@@ -631,9 +805,7 @@ app.patch('/api/produtos/:id/estoque', requireAdmin, async (req, res) => {
       resourceType: 'produto',
       resourceId: id,
       newValues: { estoque },
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: false,
       errorMessage: 'Estoque inválido.'
     });
@@ -649,9 +821,7 @@ app.patch('/api/produtos/:id/estoque', requireAdmin, async (req, res) => {
         action: 'STOCK_UPDATE_FAILED',
         resourceType: 'produto',
         resourceId: id,
-        ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-        userAgent: req.get('user-agent'),
-        requestId: req.requestId,
+        ...requestMeta(req),
         success: false,
         errorMessage: 'Produto não encontrado.'
       });
@@ -659,12 +829,12 @@ app.patch('/api/produtos/:id/estoque', requireAdmin, async (req, res) => {
     }
 
     const oldState = { estoque: currentProd.rows[0].estoque };
-    const newState = { estoque: parseInt(estoque, 10) };
+    const newState = { estoque: novoEstoque };
     const diff = auditService.computeDiff(oldState, newState);
 
     const result = await pool.query(
       'UPDATE produtos SET estoque = $1 WHERE id = $2 RETURNING *',
-      [estoque, id]
+      [novoEstoque, id]
     );
 
     auditService.saveAuditLog(pool, {
@@ -676,9 +846,7 @@ app.patch('/api/produtos/:id/estoque', requireAdmin, async (req, res) => {
       oldValues: diff.oldValues,
       newValues: diff.newValues,
       changedFields: diff.changedFields,
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: true
     });
 
@@ -691,9 +859,7 @@ app.patch('/api/produtos/:id/estoque', requireAdmin, async (req, res) => {
       action: 'STOCK_UPDATE_FAILED',
       resourceType: 'produto',
       resourceId: id,
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: false,
       errorMessage: error.message
     });
@@ -703,6 +869,9 @@ app.patch('/api/produtos/:id/estoque', requireAdmin, async (req, res) => {
 
 app.delete('/api/produtos/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
+  if (!parsePositiveInt(id)) {
+    return res.status(400).json({ error: 'Produto inválido.' });
+  }
   try {
     const currentProd = await pool.query('SELECT id, ativo, nome FROM produtos WHERE id = $1', [id]);
     if (currentProd.rows.length === 0) {
@@ -712,9 +881,7 @@ app.delete('/api/produtos/:id', requireAdmin, async (req, res) => {
         action: 'PRODUCT_DELETE_FAILED',
         resourceType: 'produto',
         resourceId: id,
-        ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-        userAgent: req.get('user-agent'),
-        requestId: req.requestId,
+        ...requestMeta(req),
         success: false,
         errorMessage: 'Produto não encontrado'
       });
@@ -736,9 +903,7 @@ app.delete('/api/produtos/:id', requireAdmin, async (req, res) => {
       oldValues: diff.oldValues,
       newValues: diff.newValues,
       changedFields: diff.changedFields,
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: true
     });
 
@@ -751,9 +916,7 @@ app.delete('/api/produtos/:id', requireAdmin, async (req, res) => {
       action: 'PRODUCT_DELETE_FAILED',
       resourceType: 'produto',
       resourceId: id,
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: false,
       errorMessage: err.message
     });
@@ -765,8 +928,10 @@ app.delete('/api/produtos/:id', requireAdmin, async (req, res) => {
 // ROTA: FINALIZAR PEDIDO (Auditoria de Pedidos e Baixa de Estoque)
 // ==========================================
 app.post('/api/pedidos', orderLimiter, requireAuth, async (req, res) => {
-  const { nome_cliente, email_cliente, endereco, cidade, cep, itens, telefone, metodo_entrega, metodo_pagamento } = req.body;
+  const { nome_cliente, endereco, cidade, cep, itens, telefone, metodo_entrega, metodo_pagamento } = req.body;
   const usuario_id = req.user.id;
+  // A confirmação vai sempre para o e-mail da conta autenticada (o corpo da requisição não decide o destinatário)
+  const email_cliente = req.user.email;
 
   const allowedMetodosEntrega = ['retirada', 'entrega'];
   const entregaTipo = allowedMetodosEntrega.includes(metodo_entrega) ? metodo_entrega : 'retirada';
@@ -783,13 +948,16 @@ app.post('/api/pedidos', orderLimiter, requireAuth, async (req, res) => {
       userEmail: req.user.email,
       action: 'ORDER_CREATE_REJECTED',
       resourceType: 'pedido',
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: false,
       errorMessage: 'Dados de pedido inválidos.'
     });
     return res.status(400).json({ error: 'Dados inválidos. Preencha todos os campos obrigatórios e adicione itens válidos.' });
+  }
+
+  const telefoneDigitos = telefone.replace(/\D/g, '');
+  if (telefoneDigitos.length < 10 || telefoneDigitos.length > 13) {
+    return res.status(400).json({ error: 'Informe um telefone válido com DDD.' });
   }
 
   if (isEntrega && (!endereco || !cidade || !cep || typeof endereco !== 'string' || typeof cidade !== 'string' || typeof cep !== 'string')) {
@@ -798,9 +966,7 @@ app.post('/api/pedidos', orderLimiter, requireAuth, async (req, res) => {
       userEmail: req.user.email,
       action: 'ORDER_CREATE_REJECTED',
       resourceType: 'pedido',
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: false,
       errorMessage: 'Endereço de entrega incompleto.'
     });
@@ -822,9 +988,7 @@ app.post('/api/pedidos', orderLimiter, requireAuth, async (req, res) => {
         userEmail: req.user.email,
         action: 'ORDER_CREATE_REJECTED',
         resourceType: 'pedido',
-        ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-        userAgent: req.get('user-agent'),
-        requestId: req.requestId,
+        ...requestMeta(req),
         success: false,
         errorMessage: `Quantidade ou ID inválido para o item: ${item.id}`
       });
@@ -844,11 +1008,11 @@ app.post('/api/pedidos', orderLimiter, requireAuth, async (req, res) => {
     for (const [itemId, qtd] of itemMap.entries()) {
       const prodRes = await client.query('SELECT id, nome, estoque, preco, ativo FROM produtos WHERE id = $1 FOR UPDATE', [itemId]);
       if (prodRes.rows.length === 0 || !prodRes.rows[0].ativo) {
-        throw new Error(`Produto #${itemId} não encontrado ou inativo.`);
+        throw new BusinessError(`Um dos produtos do carrinho (#${itemId}) não está mais disponível. Remova-o e tente novamente.`);
       }
       const prod = prodRes.rows[0];
       if (prod.estoque < qtd) {
-        throw new Error(`Estoque insuficiente para o produto: ${prod.nome}. Disponível: ${prod.estoque}, Solicitado: ${qtd}`);
+        throw new BusinessError(`Estoque insuficiente para o produto: ${prod.nome}. Disponível: ${prod.estoque}, Solicitado: ${qtd}`);
       }
       const precoUnitario = parseFloat(prod.preco);
       totalCalculado += precoUnitario * qtd;
@@ -901,9 +1065,7 @@ app.post('/api/pedidos', orderLimiter, requireAuth, async (req, res) => {
         metodo_pagamento: pagamentoTipo,
         quantidade_itens: consolidatedItens.length
       },
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: true
     });
 
@@ -919,22 +1081,28 @@ app.post('/api/pedidos', orderLimiter, requireAuth, async (req, res) => {
         const recipients = [email_cliente];
         if (adminEmail) recipients.push(adminEmail);
 
-        await transporter.sendMail({
+        const itensHtml = consolidatedItens
+          .map(item => `<li>${item.quantidade}x ${escapeHtml(item.nome)} — ${formatBRL(item.precoReal * item.quantidade)}</li>`)
+          .join('');
+
+        transporter.sendMail({
           from: `"Presenteie" <${process.env.EMAIL_USER}>`,
           to: recipients,
           subject: `Pedido #${pedidoId} Confirmado! `,
           html: `<h1>Obrigado por comprar na Presenteie, ${escapeHtml(safeNome.split(' ')[0])}!</h1>
-                 <p>Seu pedido <strong>#${pedidoId}</strong> no valor de <strong>R$ ${totalCalculado.toFixed(2)}</strong> foi confirmado.</p>
+                 <p>Seu pedido <strong>#${pedidoId}</strong> no valor de <strong>${formatBRL(totalCalculado)}</strong> foi confirmado.</p>
+                 <ul>${itensHtml}</ul>
+                 <p>Pagamento: <strong>${escapeHtml(pagamentoTipo)}</strong> · Telefone: ${escapeHtml(safeTelefone)}</p>
                  ${mensagemLocal}`
-        });
+        }).catch((err) => logger.error({ err, requestId: req.requestId, pedidoId }, 'Erro ao enviar email de confirmação'));
       } catch (err) {
         logger.error({ err, requestId: req.requestId, pedidoId }, "Erro ao enviar email de confirmação");
       }
     }
 
-    res.status(201).json({ message: 'Pedido salvo com sucesso!', pedidoId });
+    res.status(201).json({ message: 'Pedido salvo com sucesso!', pedidoId, total: totalCalculado });
   } catch (error) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => {});
     logger.error({ err: error, requestId: req.requestId }, "Erro ao salvar pedido");
 
     auditService.saveAuditLog(pool, {
@@ -942,18 +1110,39 @@ app.post('/api/pedidos', orderLimiter, requireAuth, async (req, res) => {
       userEmail: req.user.email,
       action: 'ORDER_CREATE_FAILED',
       resourceType: 'pedido',
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: false,
       errorMessage: error.message
     });
 
-    res.status(400).json({ error: error.message || 'Erro interno ao processar o pedido.' });
+    if (error instanceof BusinessError) {
+      return res.status(400).json({ error: error.message });
+    }
+    res.status(500).json({ error: 'Erro interno ao processar o pedido. Tente novamente.' });
   } finally {
     client.release();
   }
 });
+
+/**
+ * Carrega os itens de vários pedidos em uma única consulta (evita uma query por pedido).
+ */
+async function attachOrderItems(pedidos) {
+  if (pedidos.length === 0) return pedidos;
+  const resultItens = await pool.query(
+    `SELECT ip.pedido_id, ip.quantidade, ip.preco_unitario, p.nome, p.id AS produto_id, p.imagem_url
+     FROM itens_pedido ip
+     JOIN produtos p ON ip.produto_id = p.id
+     WHERE ip.pedido_id = ANY($1::int[])`,
+    [pedidos.map(p => p.id)]
+  );
+  const itensPorPedido = new Map();
+  for (const { pedido_id, ...item } of resultItens.rows) {
+    if (!itensPorPedido.has(pedido_id)) itensPorPedido.set(pedido_id, []);
+    itensPorPedido.get(pedido_id).push(item);
+  }
+  return pedidos.map(pedido => ({ ...pedido, itens: itensPorPedido.get(pedido.id) || [] }));
+}
 
 // Listar todos os pedidos (Admin)
 app.get('/api/pedidos', requireAdmin, async (req, res) => {
@@ -965,18 +1154,7 @@ app.get('/api/pedidos', requireAdmin, async (req, res) => {
        ORDER BY data_pedido DESC`
     );
     
-    const pedidos = resultPedidos.rows;
-
-    for (let pedido of pedidos) {
-      const resultItens = await pool.query(
-        `SELECT ip.quantidade, ip.preco_unitario, p.nome 
-         FROM itens_pedido ip
-         JOIN produtos p ON ip.produto_id = p.id
-         WHERE ip.pedido_id = $1`,
-        [pedido.id]
-      );
-      pedido.itens = resultItens.rows;
-    }
+    const pedidos = await attachOrderItems(resultPedidos.rows);
 
     res.json(pedidos);
   } catch (error) {
@@ -1008,18 +1186,7 @@ app.get('/api/meus-pedidos/:usuarioId', requireAuth, async (req, res) => {
       [usuarioId]
     );
     
-    const pedidos = resultPedidos.rows;
-
-    for (let pedido of pedidos) {
-      const resultItens = await pool.query(
-        `SELECT ip.quantidade, ip.preco_unitario, p.nome 
-         FROM itens_pedido ip
-         JOIN produtos p ON ip.produto_id = p.id
-         WHERE ip.pedido_id = $1`,
-        [pedido.id]
-      );
-      pedido.itens = resultItens.rows;
-    }
+    const pedidos = await attachOrderItems(resultPedidos.rows);
 
     res.json(pedidos);
   } catch (error) {
@@ -1034,7 +1201,7 @@ app.patch('/api/pedidos/:id/status', requireAdmin, async (req, res) => {
   const { status } = req.body;
 
   const statusValidos = ['pendente', 'em_separacao', 'enviado', 'entregue'];
-  if (!statusValidos.includes(status)) {
+  if (!parsePositiveInt(id) || !statusValidos.includes(status)) {
     auditService.saveAuditLog(pool, {
       userId: req.user.id,
       userEmail: req.user.email,
@@ -1042,9 +1209,7 @@ app.patch('/api/pedidos/:id/status', requireAdmin, async (req, res) => {
       resourceType: 'pedido',
       resourceId: id,
       newValues: { status },
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: false,
       errorMessage: 'Status inválido.'
     });
@@ -1060,9 +1225,7 @@ app.patch('/api/pedidos/:id/status', requireAdmin, async (req, res) => {
         action: 'ORDER_STATUS_UPDATE_FAILED',
         resourceType: 'pedido',
         resourceId: id,
-        ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-        userAgent: req.get('user-agent'),
-        requestId: req.requestId,
+        ...requestMeta(req),
         success: false,
         errorMessage: 'Pedido não encontrado.'
       });
@@ -1089,9 +1252,7 @@ app.patch('/api/pedidos/:id/status', requireAdmin, async (req, res) => {
       oldValues: diff.oldValues,
       newValues: diff.newValues,
       changedFields: diff.changedFields,
-      ipAddress: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
-      userAgent: req.get('user-agent'),
-      requestId: req.requestId,
+      ...requestMeta(req),
       success: true
     });
 
@@ -1132,12 +1293,12 @@ app.patch('/api/pedidos/:id/status', requireAdmin, async (req, res) => {
         }
 
         if (subject && htmlMessage) {
-          await transporter.sendMail({
+          transporter.sendMail({
             from: `"Presenteie" <${process.env.EMAIL_USER}>`,
             to: email,
             subject: subject,
             html: htmlMessage
-          });
+          }).catch((err) => logger.error({ err, requestId: req.requestId, pedidoId: id }, 'Erro ao enviar e-mail de status'));
         }
       }
     } catch (err) {
@@ -1221,23 +1382,41 @@ app.get('/api/admin/audit-logs', requireAdmin, async (req, res) => {
   }
 });
 
+// Rotas de API inexistentes respondem em JSON (em vez da página HTML padrão do Express)
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: 'Rota não encontrada.' });
+});
+
 // Middleware Global para Tratamento de Erros
 app.use((err, req, res, next) => {
+  // Erros de upload (tamanho/tipo de imagem) e de requisição malformada são erros do cliente
+  if (err instanceof multer.MulterError) {
+    const message = err.code === 'LIMIT_FILE_SIZE' ? 'A imagem deve ter no máximo 5MB.' : 'Falha no envio da imagem.';
+    return res.status(400).json({ error: message, requestId: req.requestId });
+  }
+  const status = err.status || err.statusCode || 500;
+  if (status < 500) {
+    const message = err.type ? 'Requisição inválida.' : err.message;
+    return res.status(status).json({ error: message, requestId: req.requestId });
+  }
+
   logger.error({ err, requestId: req.requestId, endpoint: req.originalUrl }, 'Erro não tratado capturado pelo middleware global');
   const isDev = process.env.NODE_ENV === 'development';
-  res.status(err.status || 500).json({
+  res.status(500).json({
     error: isDev ? (err.message || 'Erro interno do servidor') : 'Erro interno do servidor',
     requestId: req.requestId
   });
 });
 
 const PORT = process.env.PORT || 3001;
+// Em containers (Docker) defina HOST=0.0.0.0 para a API ficar acessível fora do container
+const HOST = process.env.HOST || 'localhost';
 
 // Exporta app, pool e utilitários para testes
 if (require.main === module) {
-  app.listen(PORT, 'localhost', () => {
-    logger.info(`Servidor rodando na porta ${PORT} em localhost`);
+  app.listen(PORT, HOST, () => {
+    logger.info(`Servidor rodando em http://${HOST}:${PORT}`);
   });
 }
 
-module.exports = { app, pool, escapeHtml };
+module.exports = { app, pool, escapeHtml, transporter };

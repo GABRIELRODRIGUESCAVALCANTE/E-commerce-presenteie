@@ -1,5 +1,7 @@
-import { createAuthClient } from "better-auth/react";
+import { createAuthClient } from 'better-auth/react';
+import { API_URL } from './api/client';
 
 export const authClient = createAuthClient({
-    baseURL: import.meta.env.VITE_API_URL ? import.meta.env.VITE_API_URL.replace('/api', '') : "http://localhost:3001" // A URL do seu backend Node
+  // O Better Auth fica montado em <backend>/api/auth; o cliente precisa apenas da origem do back-end
+  baseURL: API_URL.replace(/\/api\/?$/, ''),
 });

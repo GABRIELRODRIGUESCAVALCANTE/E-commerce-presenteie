@@ -1,12 +1,13 @@
-export function ProductSkeletonGrid({ count = 6 }) {
+export function ProductSkeletonGrid({ count = 8 }) {
   return (
-    <div className="grid-produtos">
+    <div className="product-grid" aria-hidden="true">
       {Array.from({ length: count }).map((_, i) => (
-        <div key={i} className="skeleton-card">
-          <div className="skeleton skeleton-image" />
-          <div className="skeleton skeleton-text skeleton-text--lg" />
-          <div className="skeleton skeleton-text skeleton-text--sm" />
-          <div className="skeleton skeleton-button" />
+        <div key={i} className="product-card product-card--skeleton">
+          <div className="skeleton skeleton--image" />
+          <div className="product-card__body">
+            <div className="skeleton skeleton--text" style={{ width: '80%' }} />
+            <div className="skeleton skeleton--text" style={{ width: '40%' }} />
+          </div>
         </div>
       ))}
     </div>
@@ -15,23 +16,23 @@ export function ProductSkeletonGrid({ count = 6 }) {
 
 export function OrderSkeletonList({ count = 3 }) {
   return (
-    <div className="skeleton-orders">
+    <div className="stack" aria-hidden="true">
       {Array.from({ length: count }).map((_, i) => (
-        <div key={i} className="skeleton-order-card">
-          <div className="skeleton skeleton-text skeleton-text--lg" />
-          <div className="skeleton skeleton-text" />
-          <div className="skeleton skeleton-text skeleton-text--sm" />
+        <div key={i} className="card card--padded">
+          <div className="skeleton skeleton--text" style={{ width: '30%' }} />
+          <div className="skeleton skeleton--text" style={{ width: '60%' }} />
+          <div className="skeleton skeleton--text" style={{ width: '45%' }} />
         </div>
       ))}
     </div>
   );
 }
 
-export function Spinner({ label = 'Carregando...' }) {
+export function Spinner({ label = 'Carregando...', inline = false }) {
   return (
-    <div className="spinner-wrapper">
-      <div className="spinner" />
-      <span>{label}</span>
+    <div className={inline ? 'spinner-inline' : 'spinner-wrapper'} role="status">
+      <span className="spinner" aria-hidden="true" />
+      <span className={inline ? 'sr-only' : ''}>{label}</span>
     </div>
   );
 }
