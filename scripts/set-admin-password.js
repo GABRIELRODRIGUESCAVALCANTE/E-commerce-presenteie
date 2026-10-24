@@ -20,12 +20,32 @@ const auth = betterAuth({
   }
 });
 
+/**
+ * Define (ou cria) a senha de login por e-mail para contas administrativas.
+ *
+ * Uso:
+ *   NEW_ADMIN_PASSWORD='nova-senha-forte' node scripts/set-admin-password.js [email1 email2 ...]
+ *
+ * Sem e-mails informados, usa ADMIN_EMAIL do .env. A senha NUNCA deve ser escrita neste arquivo.
+ */
 async function setAdminPassword() {
-  const newPassword = 'Niar@40610';
-  const targetEmails = [
-    'presenteie.oficial2@gmail.com',
-    'teste@gmail.com'
-  ];
+  const newPassword = process.env.NEW_ADMIN_PASSWORD;
+  const targetEmails = process.argv.slice(2).length > 0
+    ? process.argv.slice(2)
+    : [process.env.ADMIN_EMAIL].filter(Boolean);
+
+  if (!newPassword || newPassword.length < 8) {
+    console.error('Defina a variável NEW_ADMIN_PASSWORD com pelo menos 8 caracteres.');
+    process.exitCode = 1;
+    await pool.end();
+    return;
+  }
+  if (targetEmails.length === 0) {
+    console.error('Informe ao menos um e-mail como argumento ou configure ADMIN_EMAIL no .env.');
+    process.exitCode = 1;
+    await pool.end();
+    return;
+  }
 
   try {
     const ctx = await auth.$context;
